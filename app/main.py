@@ -20,6 +20,7 @@ from .bilingual import (
     align_bilingual,
 )
 from .chapters import ChapterError, plan_chapters
+from .cutrejoin import CutRejoinError, parse_cuts, rejoin_cues
 from .mapping import AnchorError, PiecewiseMapping, build_anchors
 from .placement import (
     Block,
@@ -44,14 +45,15 @@ from .topic_clip import (
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(
-    title="字幕校正、位置规划、专名统一、阅读负荷、智能断行、章节规划、择优保留、主题片段检索与双语配对工具",
+    title="字幕校正、位置规划、专名统一、阅读负荷、智能断行、章节规划、择优保留、主题片段检索、双语配对与删段接轴工具",
     description="粘贴 SRT 后可做时间漂移校正、按画面遮挡时段规划字幕上下位置、"
     "统一专名别名、分析重叠字幕叠加后的阅读负荷热区、按列数 / 行数限制智能断行、"
     "按章节数与优选停顿把整段字幕切成时长均衡的连续章节、"
     "按优先级与最小间隔从重叠字幕中择优保留必须保留条目、"
-    "按多组关键词检索覆盖所需字幕条数的最短连续字幕片段，"
-    "或把左右两份字幕按时间跨度做 1:1 / 1:2 / 2:1 单调配对。",
-    version="1.8.0",
+    "按多组关键词检索覆盖所需字幕条数的最短连续字幕片段、"
+    "把左右两份字幕按时间跨度做 1:1 / 1:2 / 2:1 单调配对，"
+    "或按若干删除区间裁切字幕、拆分跨区间条目并按累计删除时长前移接轴。",
+    version="1.9.0",
 )
 
 _FIELD_LABELS = {
@@ -71,6 +73,7 @@ _FIELD_LABELS = {
     "required_count": "关键词所需字幕条数",
     "left_srt": "左侧 SRT 内容",
     "right_srt": "右侧 SRT 内容",
+    "cuts": "删除区间",
 }
 
 
@@ -486,6 +489,60 @@ class SelectionResponse(BaseModel):
     conflicts: list[SelectionConflictView]
 
 
+class CutIn(BaseModel):
+    start: str = Field(..., description="删除区间开始时间，HH:MM:SS,mmm")
+    end: str = Field(..., description="删除区间结束时间，HH:MM:SS,mmm，须严格晚于开始")
+
+
+class CutRejoinRequest(BaseModel):
+    srt: str = Field(..., description="原始 SRT 内容")
+    cuts: list[CutIn] = Field(
+        ..., min_length=1, description="要从视频中删除的时间区间（至少 1 段）"
+    )
+
+
+class CutSegmentView(BaseModel):
+    new_order: int
+    original_start: str
+    original_end: str
+    start: str
+    end: str
+
+
+class CutCueView(BaseModel):
+    cue_order: int
+    index: str
+    original_start: str
+    original_end: str
+    status: str
+    segments: list[CutSegmentView]
+    text: str
+
+
+class CutMappingView(BaseModel):
+    cue_order: int
+    index: str
+    new_orders: list[int]
+
+
+class MergedCutView(BaseModel):
+    start: str
+    end: str
+    duration_ms: int
+
+
+class CutRejoinResponse(BaseModel):
+    rejoined_srt: str
+    merged_cuts: list[MergedCutView]
+    total_removed_ms: int
+    cue_count: int
+    kept_cue_count: int
+    dropped_cue_count: int
+    segment_count: int
+    cues: list[CutCueView]
+    mapping: list[CutMappingView]
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -534,6 +591,11 @@ def bilingual_align_page() -> FileResponse:
 @app.get("/selection")
 def selection_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "selection.html")
+
+
+@app.get("/cut-rejoin")
+def cut_rejoin_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "cut_rejoin.html")
 
 
 @app.post("/api/correct", response_model=CorrectResponse)
@@ -1086,4 +1148,81 @@ def selection(req: SelectionRequest) -> SelectionResponse | JSONResponse:
         selected_srt=format_srt(kept_cues),
         cues=cue_views,
         conflicts=[],
+    )
+
+
+@app.post("/api/cut-rejoin", response_model=CutRejoinResponse)
+def cut_rejoin(req: CutRejoinRequest) -> CutRejoinResponse | JSONResponse:
+    # 1. 先校验删除区间：时间码合法、结束严格晚于开始；
+    #    重叠或相接区间合并为升序不交的并集
+    try:
+        cuts = parse_cuts([(c.start, c.end) for c in req.cuts])
+    except CutRejoinError as exc:
+        raise HTTPException(status_code=422, detail={"type": "cuts", "message": str(exc)})
+
+    # 2. 复用现有 SRT 解析器
+    try:
+        cues = parse_srt(req.srt)
+    except SrtParseError as exc:
+        raise HTTPException(status_code=422, detail={"type": "srt", "message": str(exc)})
+
+    # 3. 按保留时间轴裁切：跨删除区间的字幕拆成多个片段、完全落入删除区间
+    #    的整条丢弃；保留片段按累计删除时长前移（片段时长不变），并从 1 连续编号
+    results = rejoin_cues(cues, cuts)
+
+    out_cues: list[Cue] = []
+    cue_views: list[CutCueView] = []
+    mapping_views: list[CutMappingView] = []
+    for cue, result in zip(cues, results):
+        new_orders: list[int] = []
+        segment_views: list[CutSegmentView] = []
+        for seg in result.segments:
+            out_cues.append(
+                Cue(index=str(seg.new_order), start=seg.start, end=seg.end, text=cue.text)
+            )
+            new_orders.append(seg.new_order)
+            segment_views.append(
+                CutSegmentView(
+                    new_order=seg.new_order,
+                    original_start=format_timecode(seg.original_start),
+                    original_end=format_timecode(seg.original_end),
+                    start=format_timecode(seg.start),
+                    end=format_timecode(seg.end),
+                )
+            )
+        cue_views.append(
+            CutCueView(
+                cue_order=result.cue_order,
+                index=cue.index,
+                original_start=format_timecode(cue.start),
+                original_end=format_timecode(cue.end),
+                status=result.status,
+                segments=segment_views,
+                text=cue.text,
+            )
+        )
+        mapping_views.append(
+            CutMappingView(
+                cue_order=result.cue_order, index=cue.index, new_orders=new_orders
+            )
+        )
+
+    return CutRejoinResponse(
+        # 全部丢弃时输出空串而非仅含换行的空文档
+        rejoined_srt=format_srt(out_cues) if out_cues else "",
+        merged_cuts=[
+            MergedCutView(
+                start=format_timecode(c.start),
+                end=format_timecode(c.end),
+                duration_ms=c.end - c.start,
+            )
+            for c in cuts
+        ],
+        total_removed_ms=sum(c.end - c.start for c in cuts),
+        cue_count=len(cues),
+        kept_cue_count=sum(1 for r in results if r.segments),
+        dropped_cue_count=sum(1 for r in results if not r.segments),
+        segment_count=len(out_cues),
+        cues=cue_views,
+        mapping=mapping_views,
     )

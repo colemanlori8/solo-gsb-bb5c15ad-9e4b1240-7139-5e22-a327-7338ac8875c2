@@ -1,6 +1,6 @@
-# 字幕校正、位置规划、专名统一、阅读负荷、智能断行、章节规划、择优保留、主题片段检索与双语配对工具
+# 字幕校正、位置规划、专名统一、阅读负荷、智能断行、章节规划、择优保留、主题片段检索、双语配对与删段接轴工具
 
-基于 **Python + FastAPI** 的轻量 Web 工具，包含九个功能页面：
+基于 **Python + FastAPI** 的轻量 Web 工具，包含十个功能页面：
 
 1. **字幕时间漂移校正**：粘贴 SRT 字幕，填入多组人工确认的「原时间 / 正确时间」
    锚点，按分段线性映射校正字幕时间，在网页预览并下载校正后的 SRT。
@@ -38,6 +38,11 @@
    子序列，在必须保留约束下最大化优先级总和，同分先取保留条数多、再取输入序号序列
    字典序小；必须保留条目彼此不相容时返回冲突序号。页面展示保留 / 舍弃条目与总优先级，
    并下载沿用原序号、原时间与原正文的保留 SRT。
+10. **删段后字幕接轴**（<http://localhost:8000/cut-rejoin>）：粘贴 SRT，填写若干
+    要从视频中删除的时间区间（毫秒精度）；先校验并合并重叠或相接的区间，再按保留
+    时间轴裁切每条字幕——跨删除区间的字幕拆成多个片段、完全落入删除区间的字幕整条
+    丢弃，所有保留片段按累计删除时长前移（片段时长不变），输出从 1 连续编号的 SRT
+    与原序号到新序号的对应表，页面展示合并后区间、逐条裁切状态并下载接轴 SRT。
 
 ## 功能与校正规则（时间漂移）
 
@@ -271,6 +276,37 @@
 - 页面以绿 / 红双色逐条表格展示保留与舍弃条目（必保条目另加标记）及总优先级，
   「下载 selected.srt」保存的就是接口返回的同一份 `selected_srt`。
 
+## 功能与接轴规则（删段后字幕接轴）
+
+- 输入 SRT（复用同一套字幕解析器）与 **至少 1 段**要从视频中删除的时间区间
+  `cuts`（`start` / `end`，`HH:MM:SS,mmm`，结束必须严格晚于开始）。
+- **先校验并合并删除区间**：重叠（下一段开始 < 上一段结束）或**相接**
+  （下一段开始 == 上一段结束）的区间合并为一个，合并后按开始时间升序、两两不交；
+  接口回显合并后的区间 `merged_cuts` 与**累计删除时长** `total_removed_ms`。
+- 字幕与删除区间都按**半开区间** `[start, end)` 处理，每条字幕区间减去删除区间
+  并集后剩下的极大连续段即保留片段。**边界恰好相接不算重叠**：字幕结束恰为某
+  删除区间的开始、或字幕开始恰为某删除区间的结束时，该字幕完整保留；字幕开始
+  恰为删除开始（或结束恰为删除结束）时，该端点落入删除区间，相应一端被裁掉。
+- **跨删除区间的字幕拆成多个片段**（每个保留片段一条输出字幕，正文随片段各自
+  完整保留，含多行正文）；**完全落入删除区间的字幕整条丢弃**（无任何保留片段）。
+- **所有保留片段按累计删除时长前移**：片段内部不含删除区间，前后端点前移量相同
+  （均为该片段之前被删除的总时长），故**片段时长不变**、整体平移；**删除起点为
+  `00:00:00,000`** 时片头内容被删除，后续内容自然前移到 0。
+- 输出 `rejoined_srt`：全部保留片段按原字幕输入顺序、片段时间顺序**从 1 连续
+  编号**重新序列化（标准 SRT，UTF-8、`\n` 换行；全部丢弃时为空串）。
+- 同时返回**原序号到新序号的对应表** `mapping`：每条输入字幕（输入序号
+  `cue_order` 从 1 开始，回显 SRT 自身序号 `index`）对应的新序号列表
+  `new_orders`——拆分条目对应多个新序号，丢弃条目对应空列表。
+- 逐条返回 `cues`：输入序号、SRT 序号、原起止时间、裁切状态 `status`
+  （`kept` 完整保留 / `trimmed` 裁切后单段 / `split` 拆成多段 / `dropped`
+  丢弃）、各保留片段的原区间与接轴后区间及新序号，以及 `cue_count` /
+  `kept_cue_count` / `dropped_cue_count` / `segment_count` 统计。
+- 页面以逐条表格（状态分色高亮：保留 / 裁切 / 拆分 / 丢弃）、合并后区间表与
+  对应表展示结果，「下载 rejoined.srt」保存的就是接口返回的同一份
+  `rejoined_srt`。删除区间为空列表、区间起止无效（格式错误或结束不晚于开始）、
+  SRT 无法解析时，接口均返回 `422`（区间错误 `detail.type` 为 `cuts`，
+  SRT 错误为 `srt`，字段校验错误由 `detail.field` 指出字段）。
+
 ## 一条命令启动（Docker Compose）
 
 ```bash
@@ -288,6 +324,7 @@ docker compose up -d --build
 - 字幕主题短片段检索界面：<http://localhost:8000/topic-clip>
 - 双语字幕配对界面：<http://localhost:8000/bilingual-align>
 - 重叠字幕择优保留界面：<http://localhost:8000/selection>
+- 删段后字幕接轴界面：<http://localhost:8000/cut-rejoin>
 - 时间漂移接口：`POST` <http://localhost:8000/api/correct>
 - 位置规划接口：`POST` <http://localhost:8000/api/placement>
 - 阅读负荷接口：`POST` <http://localhost:8000/api/reading-load>
@@ -297,6 +334,7 @@ docker compose up -d --build
 - 主题片段检索接口：`POST` <http://localhost:8000/api/topic-clip>
 - 双语字幕配对接口：`POST` <http://localhost:8000/api/bilingual-align>
 - 重叠字幕择优保留接口：`POST` <http://localhost:8000/api/selection>
+- 删段后字幕接轴接口：`POST` <http://localhost:8000/api/cut-rejoin>
 - 健康检查：<http://localhost:8000/health>
 - 接口文档（FastAPI 自带）：<http://localhost:8000/docs>
 
@@ -318,8 +356,8 @@ HOST_PORT=9000 docker compose up -d --build
 # 访问 http://localhost:9000/ 、http://localhost:9000/placement 、
 # http://localhost:9000/reading-load 、http://localhost:9000/terms 、
 # http://localhost:9000/wrap 、http://localhost:9000/chapters 、
-# http://localhost:9000/topic-clip 、http://localhost:9000/bilingual-align
-# 与 http://localhost:9000/selection
+# http://localhost:9000/topic-clip 、http://localhost:9000/bilingual-align 、
+# http://localhost:9000/selection 与 http://localhost:9000/cut-rejoin
 ```
 
 ## 不用 Docker，直接运行（Python 3.10+）
@@ -332,8 +370,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 同样访问 <http://localhost:8000/>、<http://localhost:8000/placement>、
 <http://localhost:8000/reading-load>、<http://localhost:8000/terms>、
 <http://localhost:8000/wrap>、<http://localhost:8000/chapters>、
-<http://localhost:8000/topic-clip>、<http://localhost:8000/bilingual-align>
-与 <http://localhost:8000/selection>。
+<http://localhost:8000/topic-clip>、<http://localhost:8000/bilingual-align>、
+<http://localhost:8000/selection> 与 <http://localhost:8000/cut-rejoin>。
 
 ## HTTP 接口
 
@@ -590,12 +628,47 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 重复、优先级非正整数、最小间隔非非负整数或 SRT 解析失败时返回 `422`
 （参数错误 `detail.type` 为 `selection`，SRT 错误为 `srt`）。
 
+### `POST /api/cut-rejoin`
+
+```json
+{
+  "srt": "1\n00:00:00,000 --> 00:00:04,000\n开场白\n\n2\n00:00:04,000 --> 00:00:12,000\n横跨删除区间的一句\n\n3\n00:00:12,000 --> 00:00:16,000\n结尾\n",
+  "cuts": [
+    {"start": "00:00:06,000", "end": "00:00:08,000"},
+    {"start": "00:00:08,000", "end": "00:00:10,000"}
+  ]
+}
+```
+
+`cuts` 为至少 1 段删除区间（`start` / `end`，`HH:MM:SS,mmm`，结束必须严格
+晚于开始）；重叠或相接的区间先合并（上例合并为 `00:00:06,000` →
+`00:00:10,000`）。成功返回：
+
+- `rejoined_srt`：保留片段按累计删除时长前移后**从 1 连续编号**的完整 SRT
+  （上例第 2 条被拆成 `00:00:04,000 --> 00:00:06,000` 与
+  `00:00:06,000 --> 00:00:08,000` 两段，第 3 条前移为
+  `00:00:08,000 --> 00:00:12,000`；全部丢弃时为空串）；
+- `merged_cuts`：合并后的删除区间（`start` / `end` / `duration_ms`）与
+  `total_removed_ms`（累计删除毫秒数）；
+- `cues`：逐条字幕的输入序号 `cue_order`、SRT 序号 `index`、原起止时间、
+  裁切状态 `status`（`kept` / `trimmed` / `split` / `dropped`）、各保留片段
+  （`new_order`、原区间 `original_start` / `original_end` 与接轴后区间
+  `start` / `end`）与正文 `text`；
+- `mapping`：原序号到新序号的对应表（`cue_order` / `index` /
+  `new_orders`，拆分条目对应多个新序号，丢弃条目为空列表）；
+- `cue_count` / `kept_cue_count` / `dropped_cue_count` / `segment_count`。
+
+边界按半开区间处理：字幕结束恰为删除开始、或字幕开始恰为删除结束时完整保留；
+删除起点为 `00:00:00,000` 时后续内容前移到 0。删除区间为空列表、区间起止无效
+或 SRT 解析失败时返回 `422`（区间错误 `detail.type` 为 `cuts`，SRT 错误为
+`srt`）。
+
 ## 目录结构
 
 ```
 .
 ├── app/
-│   ├── main.py           # FastAPI 应用、/api/correct、/api/placement、/api/reading-load、/api/terms、/api/wrap、/api/chapters、/api/topic-clip、/api/bilingual-align 与 /api/selection 接口
+│   ├── main.py           # FastAPI 应用、/api/correct、/api/placement、/api/reading-load、/api/terms、/api/wrap、/api/chapters、/api/topic-clip、/api/bilingual-align、/api/selection 与 /api/cut-rejoin 接口
 │   ├── mapping.py        # 锚点校验与分段线性映射
 │   ├── placement.py      # 遮挡时段并集、遮挡时长统计、位置规划 DP、WebVTT 导出
 │   ├── reading_load.py   # 字 / 秒速率、半开时间轴事件扫描、热区合并与最短时长过滤
@@ -605,6 +678,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 │   ├── topic_clip.py     # 关键词 casefold 命中、开始时间非递减校验与最短连续窗口滑动检索
 │   ├── bilingual.py      # 双语字幕单调配对 DP（1:1 / 1:2 / 2:1 与单侧跳过、操作序列同分裁决）
 │   ├── selection.py      # 重叠字幕择优保留 DP（优先级 / 条数 / 序号字典序三级编码加权区间调度）
+│   ├── cutrejoin.py      # 删除区间校验合并、字幕裁切拆分与按累计删除时长前移接轴
 │   ├── srt.py            # SRT 解析、正文行定位与无损重写（保留原格式）
 │   ├── timecode.py       # 时间码解析与格式化（SRT / WebVTT）
 │   └── static/
@@ -616,7 +690,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 │       ├── chapters.html      # 字幕章节规划页面（原生 HTML/CSS/JS）
 │       ├── topic_clip.html    # 字幕主题短片段检索页面（原生 HTML/CSS/JS）
 │       ├── bilingual_align.html  # 双语字幕配对页面（原生 HTML/CSS/JS）
-│       └── selection.html     # 重叠字幕择优保留页面（原生 HTML/CSS/JS）
+│       ├── selection.html     # 重叠字幕择优保留页面（原生 HTML/CSS/JS）
+│       └── cut_rejoin.html    # 删段后字幕接轴页面（原生 HTML/CSS/JS）
 ├── tests/               # 核心算法与接口测试
 ├── Dockerfile
 ├── docker-compose.yml

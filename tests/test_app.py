@@ -12,6 +12,19 @@ from app.bilingual import (
     align_bilingual,
 )
 from app.chapters import ChapterError, plan_chapters
+from app.cutrejoin import (
+    DROPPED,
+    KEPT,
+    SPLIT,
+    TRIMMED,
+    Cut,
+    CutRejoinError,
+    cut_cue,
+    merge_cuts,
+    parse_cuts,
+    rejoin_cues,
+    removed_before,
+)
 from app.linewrap import (
     WrapFailure,
     WrapPlan,
@@ -2477,3 +2490,248 @@ def test_api_selection_requires_srt_and_gap():
     assert client.post(
         "/api/selection", json={"srt": SELECTION_SRT}
     ).status_code == 422
+
+
+# ---------- 删段后字幕接轴 ----------
+
+CUTREJOIN_SRT = (
+    "1\n00:00:00,000 --> 00:00:04,000\n大家好，欢迎收看本期节目\n\n"
+    "2\n00:00:04,000 --> 00:00:08,000\n今天聊一个轻松的话题\n\n"
+    "3\n00:00:08,000 --> 00:00:12,000\n这一段完全落在删除区间里\n\n"
+    "4\n00:00:12,000 --> 00:00:17,000\n这一句的头部被裁掉\n\n"
+    "5\n00:00:17,000 --> 00:00:26,000\n这一句横跨删除区间被拆成两段\n\n"
+    "6\n00:00:26,000 --> 00:00:30,000\n感谢收看，我们下期再见\n"
+)
+
+CUTREJOIN_CUTS = [
+    {"start": "00:00:08,000", "end": "00:00:13,000"},
+    {"start": "00:00:13,000", "end": "00:00:15,000"},
+    {"start": "00:00:20,000", "end": "00:00:24,000"},
+]
+
+
+def _cutrejoin_cuts():
+    return parse_cuts([(c["start"], c["end"]) for c in CUTREJOIN_CUTS])
+
+
+def test_parse_cuts_merges_overlapping_and_touching():
+    # 乱序输入：相接的 [8000,13000)+[13000,15000) 合并，重叠的 [20000,24000)+[22000,26000) 合并
+    cuts = parse_cuts([
+        ("00:00:20,000", "00:00:24,000"),
+        ("00:00:08,000", "00:00:13,000"),
+        ("00:00:13,000", "00:00:15,000"),
+        ("00:00:22,000", "00:00:26,000"),
+    ])
+    assert cuts == [Cut(8000, 15000), Cut(20000, 26000)]
+    # 恰好相接（前段结束 == 后段开始）也合并；包含关系被吞并
+    assert merge_cuts([Cut(0, 1000), Cut(1000, 2000), Cut(500, 1500)]) == [Cut(0, 2000)]
+    # 不相接的区间保持分开并按开始升序
+    assert merge_cuts([Cut(3000, 4000), Cut(0, 1000)]) == [Cut(0, 1000), Cut(3000, 4000)]
+
+
+def test_parse_cuts_rejects_invalid():
+    with pytest.raises(CutRejoinError, match="第 1 个删除区间的开始时间无效"):
+        parse_cuts([("not-a-time", "00:00:01,000")])
+    with pytest.raises(CutRejoinError, match="第 2 个删除区间的结束时间无效"):
+        parse_cuts([("00:00:01,000", "00:00:02,000"), ("00:00:03,000", "bad")])
+    # 结束等于或早于开始都拒绝
+    with pytest.raises(CutRejoinError, match="严格晚于"):
+        parse_cuts([("00:00:02,000", "00:00:02,000")])
+    with pytest.raises(CutRejoinError, match="严格晚于"):
+        parse_cuts([("00:00:03,500", "00:00:02,000")])
+
+
+def test_removed_before_boundaries():
+    cuts = [Cut(8000, 15000), Cut(20000, 24000)]
+    assert removed_before(cuts, 0) == 0
+    assert removed_before(cuts, 8000) == 0       # 恰为删除开始：该段不计入
+    assert removed_before(cuts, 15000) == 7000   # 恰为删除结束：该段完整计入
+    assert removed_before(cuts, 20000) == 7000
+    assert removed_before(cuts, 24000) == 11000
+    assert removed_before(cuts, 99999) == 11000
+
+
+def test_cut_cue_untouched_and_dropped():
+    cuts = [Cut(8000, 15000)]
+    assert cut_cue(0, 4000, cuts) == [(0, 4000)]       # 与删除区间不交
+    assert cut_cue(9000, 14000, cuts) == []            # 完全落入删除区间
+    assert cut_cue(8000, 15000, cuts) == []            # 与删除区间完全重合
+
+
+def test_cut_cue_touching_boundaries_kept():
+    cuts = [Cut(8000, 15000)]
+    # 边界恰好相接不算重叠：字幕结束 == 删除开始、字幕开始 == 删除结束
+    assert cut_cue(4000, 8000, cuts) == [(4000, 8000)]
+    assert cut_cue(15000, 19000, cuts) == [(15000, 19000)]
+    # 字幕开始 == 删除开始（或结束 == 删除结束）：端点落入删除区间
+    assert cut_cue(8000, 12000, cuts) == []
+    assert cut_cue(10000, 15000, cuts) == []
+    assert cut_cue(8000, 20000, cuts) == [(15000, 20000)]
+    assert cut_cue(0, 15000, cuts) == [(0, 8000)]
+
+
+def test_cut_cue_trims_and_splits():
+    cuts = [Cut(8000, 15000), Cut(20000, 24000)]
+    assert cut_cue(5000, 10000, cuts) == [(5000, 8000)]              # 裁尾
+    assert cut_cue(12000, 18000, cuts) == [(15000, 18000)]           # 裁头
+    assert cut_cue(5000, 18000, cuts) == [(5000, 8000), (15000, 18000)]  # 中间挖洞拆分
+    # 跨两个删除区间拆成三段
+    assert cut_cue(5000, 26000, cuts) == [(5000, 8000), (15000, 20000), (24000, 26000)]
+
+
+def test_rejoin_cues_status_segments_and_numbering():
+    cues = parse_srt(CUTREJOIN_SRT)
+    results = rejoin_cues(cues, _cutrejoin_cuts())
+    assert [r.status for r in results] == [KEPT, KEPT, DROPPED, TRIMMED, SPLIT, KEPT]
+    assert [r.cue_order for r in results] == [1, 2, 3, 4, 5, 6]
+    # 保留片段从 1 连续编号
+    assert [s.new_order for r in results for s in r.segments] == [1, 2, 3, 4, 5, 6]
+    # 第 4 条裁头：原片段 [15000,17000) 前移 7000，时长不变
+    seg = results[3].segments[0]
+    assert (seg.original_start, seg.original_end) == (15000, 17000)
+    assert (seg.start, seg.end) == (8000, 10000)
+    # 第 5 条拆分：两段分别前移 7000 / 11000
+    assert [(s.original_start, s.original_end, s.start, s.end) for s in results[4].segments] == [
+        (17000, 20000, 10000, 13000),
+        (24000, 26000, 13000, 15000),
+    ]
+    # 完整保留的第 6 条也按累计删除时长前移
+    seg6 = results[5].segments[0]
+    assert (seg6.original_start, seg6.original_end) == (26000, 30000)
+    assert (seg6.start, seg6.end) == (15000, 19000)
+    # 丢弃条目没有片段
+    assert results[2].segments == ()
+
+
+def test_rejoin_cues_zero_start_cut():
+    # 删除起点为零：片头内容被删除，后续内容前移到 0
+    cues = parse_srt(
+        "1\n00:00:00,000 --> 00:00:02,000\n片头被删\n\n"
+        "2\n00:00:02,000 --> 00:00:05,000\n后续前移\n"
+    )
+    results = rejoin_cues(cues, parse_cuts([("00:00:00,000", "00:00:02,000")]))
+    assert [r.status for r in results] == [DROPPED, KEPT]
+    seg = results[1].segments[0]
+    assert (seg.start, seg.end) == (0, 3000)
+    assert seg.new_order == 1
+
+
+def test_cut_rejoin_page_served():
+    resp = client.get("/cut-rejoin")
+    assert resp.status_code == 200
+    assert "删段后字幕接轴" in resp.text
+    assert "/api/cut-rejoin" in resp.text
+
+
+def cutrejoin_body(**overrides):
+    body = {"srt": CUTREJOIN_SRT, "cuts": CUTREJOIN_CUTS}
+    body.update(overrides)
+    return body
+
+
+def test_api_cut_rejoin_success():
+    resp = client.post("/api/cut-rejoin", json=cutrejoin_body())
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    # 相接区间 [8000,13000)+[13000,15000) 已合并
+    assert data["merged_cuts"] == [
+        {"start": "00:00:08,000", "end": "00:00:15,000", "duration_ms": 7000},
+        {"start": "00:00:20,000", "end": "00:00:24,000", "duration_ms": 4000},
+    ]
+    assert data["total_removed_ms"] == 11000
+    assert data["cue_count"] == 6
+    assert data["kept_cue_count"] == 5 and data["dropped_cue_count"] == 1
+    assert data["segment_count"] == 6
+    assert [c["status"] for c in data["cues"]] == [
+        "kept", "kept", "dropped", "trimmed", "split", "kept"
+    ]
+    # 原序号到新序号的对应表（一条原字幕可对应多个新序号）
+    assert [(m["cue_order"], m["index"], m["new_orders"]) for m in data["mapping"]] == [
+        (1, "1", [1]), (2, "2", [2]), (3, "3", []),
+        (4, "4", [3]), (5, "5", [4, 5]), (6, "6", [6]),
+    ]
+    # 连续编号的接轴 SRT：保留片段前移、正文保留
+    assert data["rejoined_srt"] == (
+        "1\n00:00:00,000 --> 00:00:04,000\n大家好，欢迎收看本期节目\n\n"
+        "2\n00:00:04,000 --> 00:00:08,000\n今天聊一个轻松的话题\n\n"
+        "3\n00:00:08,000 --> 00:00:10,000\n这一句的头部被裁掉\n\n"
+        "4\n00:00:10,000 --> 00:00:13,000\n这一句横跨删除区间被拆成两段\n\n"
+        "5\n00:00:13,000 --> 00:00:15,000\n这一句横跨删除区间被拆成两段\n\n"
+        "6\n00:00:15,000 --> 00:00:19,000\n感谢收看，我们下期再见\n"
+    )
+    # 片段视图同时给出原区间与接轴后区间
+    seg = data["cues"][4]["segments"][1]
+    assert seg["new_order"] == 5
+    assert seg["original_start"] == "00:00:24,000"
+    assert seg["original_end"] == "00:00:26,000"
+    assert seg["start"] == "00:00:13,000"
+    assert seg["end"] == "00:00:15,000"
+
+
+def test_api_cut_rejoin_preserves_multiline_text_and_index():
+    srt = "7\n00:00:00,000 --> 00:00:10,000\n第一行\n第二行\n"
+    body = cutrejoin_body(
+        srt=srt, cuts=[{"start": "00:00:04,000", "end": "00:00:06,000"}]
+    )
+    data = client.post("/api/cut-rejoin", json=body).json()
+    assert [c["status"] for c in data["cues"]] == ["split"]
+    # 拆分后的片段各自保留完整多行正文；输出重新连续编号
+    assert data["rejoined_srt"] == (
+        "1\n00:00:00,000 --> 00:00:04,000\n第一行\n第二行\n\n"
+        "2\n00:00:04,000 --> 00:00:08,000\n第一行\n第二行\n"
+    )
+    assert data["mapping"] == [{"cue_order": 1, "index": "7", "new_orders": [1, 2]}]
+
+
+def test_api_cut_rejoin_all_dropped_returns_empty_srt():
+    srt = "1\n00:00:01,000 --> 00:00:02,000\n被删\n"
+    body = cutrejoin_body(
+        srt=srt, cuts=[{"start": "00:00:00,000", "end": "00:00:03,000"}]
+    )
+    resp = client.post("/api/cut-rejoin", json=body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["rejoined_srt"] == ""
+    assert data["segment_count"] == 0
+    assert data["kept_cue_count"] == 0 and data["dropped_cue_count"] == 1
+    assert data["mapping"] == [{"cue_order": 1, "index": "1", "new_orders": []}]
+
+
+def test_api_cut_rejoin_rejects_bad_cuts():
+    # 结束不晚于开始
+    resp = client.post(
+        "/api/cut-rejoin",
+        json=cutrejoin_body(cuts=[{"start": "00:00:02,000", "end": "00:00:02,000"}]),
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["type"] == "cuts"
+    assert "严格晚于" in detail["message"]
+
+    # 时间格式错误，消息指出第几个区间
+    resp = client.post(
+        "/api/cut-rejoin",
+        json=cutrejoin_body(cuts=[
+            {"start": "00:00:01,000", "end": "00:00:02,000"},
+            {"start": "abc", "end": "00:00:03,000"},
+        ]),
+    )
+    assert resp.status_code == 422
+    assert "第 2 个删除区间" in resp.json()["detail"]["message"]
+
+
+def test_api_cut_rejoin_rejects_bad_srt():
+    resp = client.post("/api/cut-rejoin", json=cutrejoin_body(srt="garbage"))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["type"] == "srt"
+
+
+def test_api_cut_rejoin_requires_fields_and_nonempty_cuts():
+    assert client.post("/api/cut-rejoin", json={}).status_code == 422
+    assert client.post(
+        "/api/cut-rejoin", json={"cuts": CUTREJOIN_CUTS}
+    ).status_code == 422
+    # 删除区间至少 1 段
+    resp = client.post("/api/cut-rejoin", json={"srt": CUTREJOIN_SRT, "cuts": []})
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["field"] == "cuts"
