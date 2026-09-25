@@ -12,6 +12,15 @@ from app.bilingual import (
     align_bilingual,
 )
 from app.chapters import ChapterError, plan_chapters
+from app.cutshift import (
+    Cut,
+    CutShiftError,
+    deleted_before,
+    kept_fragments,
+    merge_cuts,
+    parse_cuts,
+    shift_cues,
+)
 from app.linewrap import (
     WrapFailure,
     WrapPlan,
@@ -2477,3 +2486,273 @@ def test_api_selection_requires_srt_and_gap():
     assert client.post(
         "/api/selection", json={"srt": SELECTION_SRT}
     ).status_code == 422
+
+
+# ---------- 删段后字幕接轴 ----------
+
+CUTSHIFT_SRT = (
+    "1\n00:00:01,000 --> 00:00:04,000\n开场白\n\n"
+    "2\n00:00:05,000 --> 00:00:09,500\n被删段从中裁断的字幕\n\n"
+    "3\n00:00:10,000 --> 00:00:12,000\n整段落在删除区间内\n\n"
+    "4\n00:00:13,000 --> 00:00:16,000\n起点接在删除区间末尾\n\n"
+    "5\n00:00:16,500 --> 00:00:19,000\n片尾整体前移\n"
+)
+
+# 前两段首尾相接（08:00 == 08:00），合并为 06:00–09:00；第三段独立
+CUTSHIFT_CUTS = [
+    {"start": "00:00:06,000", "end": "00:00:08,000"},
+    {"start": "00:00:08,000", "end": "00:00:09,000"},
+    {"start": "00:00:09,500", "end": "00:00:13,000"},
+]
+
+
+def test_merge_cuts_overlapping_touching_and_unsorted():
+    cuts = parse_cuts([
+        ("00:00:10,000", "00:00:12,000"),  # 与下一段重叠
+        ("00:00:11,000", "00:00:13,000"),
+        ("00:00:13,000", "00:00:14,000"),  # 与上一段首尾相接
+        ("00:00:01,000", "00:00:02,000"),  # 乱序输入的独立段
+    ])
+    assert cuts == [Cut(1000, 2000), Cut(10000, 14000)]
+    # 互不重叠也不相接的区间保持独立
+    assert parse_cuts([("00:00:01,000", "00:00:02,000"),
+                       ("00:00:02,001", "00:00:03,000")]) == [
+        Cut(1000, 2000), Cut(2001, 3000)
+    ]
+    assert parse_cuts([]) == []
+
+
+def test_parse_cuts_rejects_invalid():
+    with pytest.raises(CutShiftError, match="开始时间无效"):
+        parse_cuts([("not-a-time", "00:00:01,000")])
+    with pytest.raises(CutShiftError, match="结束时间无效"):
+        parse_cuts([("00:00:01,000", "abc")])
+    with pytest.raises(CutShiftError, match="严格晚于"):
+        parse_cuts([("00:00:02,000", "00:00:01,000")])
+    with pytest.raises(CutShiftError, match="严格晚于"):
+        parse_cuts([("00:00:01,000", "00:00:01,000")])  # 零长度区间
+    # 报错指出是第几个区间
+    with pytest.raises(CutShiftError, match="第 2 个删除区间"):
+        parse_cuts([("00:00:01,000", "00:00:02,000"), ("bad", "00:00:03,000")])
+
+
+def test_deleted_before_cumulative():
+    cuts = [Cut(2000, 3000), Cut(5000, 6000)]
+    assert deleted_before(0, cuts) == 0
+    assert deleted_before(2000, cuts) == 0       # 删除开始处尚未计入本段
+    assert deleted_before(2500, cuts) == 500
+    assert deleted_before(3000, cuts) == 1000
+    assert deleted_before(4000, cuts) == 1000    # 两段之间不再增长
+    assert deleted_before(6000, cuts) == 2000
+    assert deleted_before(99999, cuts) == 2000
+
+
+def test_kept_fragments_touching_boundaries_kept_whole():
+    cuts = [Cut(2000, 3000)]
+    # 字幕结束恰为删除开始：完整保留
+    assert kept_fragments(1000, 2000, cuts) == [(1000, 2000)]
+    # 字幕开始恰为删除结束：完整保留
+    assert kept_fragments(3000, 4000, cuts) == [(3000, 4000)]
+    # 字幕与删除区间完全相等：丢弃
+    assert kept_fragments(2000, 3000, cuts) == []
+    # 字幕开始恰为删除开始：头部被裁，只剩删除结束之后的部分
+    assert kept_fragments(2000, 3500, cuts) == [(3000, 3500)]
+    # 字幕结束恰为删除结束：尾部被裁
+    assert kept_fragments(1500, 3000, cuts) == [(1500, 2000)]
+
+
+def test_shift_cues_split_drop_and_shift():
+    cues = parse_srt(CUTSHIFT_SRT)
+    cuts = parse_cuts([(c["start"], c["end"]) for c in CUTSHIFT_CUTS])
+    assert cuts == [Cut(6000, 9000), Cut(9500, 13000)]
+    shifts = shift_cues(cues, cuts)
+
+    # 第 1 条在删除区间之前：完整保留、不移动
+    assert shifts[0].kept and len(shifts[0].fragments) == 1
+    f = shifts[0].fragments[0]
+    assert (f.original_start, f.original_end, f.new_start, f.new_end) == (1000, 4000, 1000, 4000)
+
+    # 第 2 条 [5000, 9500) 跨合并后的删除段 [6000, 9000)：拆成两段，
+    # 后段前移 3000ms 后与前段在新时间轴上首尾相接
+    frags = shifts[1].fragments
+    assert len(frags) == 2
+    assert (frags[0].original_start, frags[0].original_end) == (5000, 6000)
+    assert (frags[0].new_start, frags[0].new_end) == (5000, 6000)
+    assert (frags[1].original_start, frags[1].original_end) == (9000, 9500)
+    assert (frags[1].new_start, frags[1].new_end) == (6000, 6500)
+
+    # 第 3 条完全落入 [9500, 13000)：丢弃
+    assert not shifts[2].kept and shifts[2].fragments == ()
+
+    # 第 4 条开始恰为删除结束 13000：完整保留，累计前移 3000 + 3500 = 6500ms
+    f4 = shifts[3].fragments[0]
+    assert (f4.original_start, f4.original_end) == (13000, 16000)
+    assert (f4.new_start, f4.new_end) == (6500, 9500)
+
+    # 第 5 条整体前移 6500ms，时长不变
+    f5 = shifts[4].fragments[0]
+    assert (f5.new_start, f5.new_end) == (10000, 12500)
+    assert f5.new_end - f5.new_start == f5.original_end - f5.original_start
+
+
+def test_shift_cues_deletion_from_zero():
+    cues = parse_srt(
+        "1\n00:00:00,500 --> 00:00:01,500\n片头被删\n\n"
+        "2\n00:00:02,000 --> 00:00:05,000\n正片开始\n"
+    )
+    cuts = parse_cuts([("00:00:00,000", "00:00:02,000")])
+    shifts = shift_cues(cues, cuts)
+    # 第 1 条完全落入 [0, 2000)：丢弃
+    assert not shifts[0].kept
+    # 第 2 条开始恰为删除结束：完整保留并前移到 0
+    f = shifts[1].fragments[0]
+    assert (f.new_start, f.new_end) == (0, 3000)
+
+    # 从 0 开始的删除裁掉字幕头部：剩余片段起点移到 0
+    cues2 = parse_srt("1\n00:00:00,000 --> 00:00:05,000\n从头被裁\n")
+    shifts2 = shift_cues(cues2, cuts)
+    f2 = shifts2[0].fragments[0]
+    assert (f2.original_start, f2.original_end) == (2000, 5000)
+    assert (f2.new_start, f2.new_end) == (0, 3000)
+
+
+def test_shift_cues_spanning_multiple_cuts_stays_continuous():
+    cues = parse_srt("1\n00:00:00,000 --> 00:00:10,000\n跨两段删除\n")
+    cuts = parse_cuts([("00:00:02,000", "00:00:03,000"),
+                       ("00:00:05,000", "00:00:06,000")])
+    frags = shift_cues(cues, cuts)[0].fragments
+    assert [(f.new_start, f.new_end) for f in frags] == [
+        (0, 2000), (2000, 4000), (4000, 8000)
+    ]
+    # 新时间轴上各片段首尾相接，总时长 = 原时长 − 删除时长
+    assert all(a.new_end == b.new_start for a, b in zip(frags, frags[1:]))
+    assert sum(f.new_end - f.new_start for f in frags) == 10000 - 2000
+
+
+def test_shift_cues_no_cuts_identity():
+    cues = parse_srt(CUTSHIFT_SRT)
+    shifts = shift_cues(cues, [])
+    assert all(s.kept and len(s.fragments) == 1 for s in shifts)
+    for cue, shift in zip(cues, shifts):
+        f = shift.fragments[0]
+        assert (f.new_start, f.new_end) == (cue.start, cue.end)
+
+
+def test_cut_shift_page_served():
+    resp = client.get("/cut-shift")
+    assert resp.status_code == 200
+    assert "删段后字幕接轴" in resp.text
+    assert "/api/cut-shift" in resp.text
+
+
+def cut_shift_body(**overrides):
+    body = {"srt": CUTSHIFT_SRT, "cuts": CUTSHIFT_CUTS}
+    body.update(overrides)
+    return body
+
+
+def test_api_cut_shift_success():
+    resp = client.post("/api/cut-shift", json=cut_shift_body())
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["cue_count"] == 5
+    assert data["kept_count"] == 4 and data["dropped_count"] == 1
+    assert data["split_count"] == 1 and data["fragment_count"] == 5
+    assert data["total_cut_ms"] == 6500
+    assert data["merged_cuts"] == [
+        {"start": "00:00:06,000", "end": "00:00:09,000"},
+        {"start": "00:00:09,500", "end": "00:00:13,000"},
+    ]
+    # 连续编号的输出 SRT：拆分片段各自编号、正文保留
+    assert data["shifted_srt"] == (
+        "1\n00:00:01,000 --> 00:00:04,000\n开场白\n\n"
+        "2\n00:00:05,000 --> 00:00:06,000\n被删段从中裁断的字幕\n\n"
+        "3\n00:00:06,000 --> 00:00:06,500\n被删段从中裁断的字幕\n\n"
+        "4\n00:00:06,500 --> 00:00:09,500\n起点接在删除区间末尾\n\n"
+        "5\n00:00:10,000 --> 00:00:12,500\n片尾整体前移\n"
+    )
+    # 原序号 → 新序号对应表（被丢弃的第 3 条对应空列表）
+    assert [(m["index"], m["new_indices"]) for m in data["mapping"]] == [
+        ("1", [1]), ("2", [2, 3]), ("3", []), ("4", [4]), ("5", [5])
+    ]
+    # 逐条视图：kept 标记与片段的新旧时间轴
+    assert [c["kept"] for c in data["cues"]] == [True, True, False, True, True]
+    frag = data["cues"][1]["fragments"][1]
+    assert frag["new_index"] == 3
+    assert frag["original_start"] == "00:00:09,000"
+    assert frag["start"] == "00:00:06,000" and frag["end"] == "00:00:06,500"
+
+
+def test_api_cut_shift_empty_cuts_renumbers_only():
+    resp = client.post("/api/cut-shift", json=cut_shift_body(cuts=[]))
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["merged_cuts"] == [] and data["total_cut_ms"] == 0
+    assert data["fragment_count"] == 5 and data["dropped_count"] == 0
+    # 时间不动，仅按输入顺序从 1 连续编号
+    assert data["shifted_srt"].startswith("1\n00:00:01,000 --> 00:00:04,000\n开场白\n")
+    assert "5\n00:00:16,500 --> 00:00:19,000\n片尾整体前移\n" in data["shifted_srt"]
+    assert [m["new_indices"] for m in data["mapping"]] == [[1], [2], [3], [4], [5]]
+
+
+def test_api_cut_shift_all_dropped_outputs_empty():
+    body = cut_shift_body(
+        srt="1\n00:00:01,000 --> 00:00:02,000\n整条被删\n",
+        cuts=[{"start": "00:00:00,000", "end": "00:00:10,000"}],
+    )
+    resp = client.post("/api/cut-shift", json=body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["shifted_srt"] == ""
+    assert data["fragment_count"] == 0 and data["dropped_count"] == 1
+    assert data["mapping"] == [{"cue_order": 1, "index": "1", "new_indices": []}]
+
+
+def test_api_cut_shift_deletion_from_zero():
+    body = cut_shift_body(
+        srt="1\n00:00:00,500 --> 00:00:01,500\n片头被删\n\n"
+            "2\n00:00:02,000 --> 00:00:05,000\n正片开始\n",
+        cuts=[{"start": "00:00:00,000", "end": "00:00:02,000"}],
+    )
+    resp = client.post("/api/cut-shift", json=body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["shifted_srt"] == "1\n00:00:00,000 --> 00:00:03,000\n正片开始\n"
+    assert data["mapping"] == [
+        {"cue_order": 1, "index": "1", "new_indices": []},
+        {"cue_order": 2, "index": "2", "new_indices": [1]},
+    ]
+
+
+def test_api_cut_shift_rejects_bad_srt():
+    resp = client.post("/api/cut-shift", json=cut_shift_body(srt="garbage"))
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["type"] == "srt"
+
+
+def test_api_cut_shift_rejects_bad_cuts():
+    # 结束不晚于开始
+    resp = client.post(
+        "/api/cut-shift",
+        json=cut_shift_body(cuts=[{"start": "00:00:02,000", "end": "00:00:01,000"}]),
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["type"] == "cuts"
+    assert "严格晚于" in resp.json()["detail"]["message"]
+
+    # 时间格式非法
+    resp = client.post(
+        "/api/cut-shift",
+        json=cut_shift_body(cuts=[{"start": "abc", "end": "00:00:01,000"}]),
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["type"] == "cuts"
+
+    # 区间字段缺失 / 类型错误走请求体校验
+    assert client.post(
+        "/api/cut-shift", json={"srt": CUTSHIFT_SRT, "cuts": [{"start": "00:00:01,000"}]}
+    ).status_code == 422
+    assert client.post(
+        "/api/cut-shift", json={"srt": CUTSHIFT_SRT, "cuts": "00:00:01,000"}
+    ).status_code == 422
+    assert client.post("/api/cut-shift", json={"cuts": []}).status_code == 422

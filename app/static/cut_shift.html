@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>删段后字幕接轴</title>
+<style>
+  :root {
+    --bg: #f4f6fa;
+    --card: #ffffff;
+    --border: #d9dee8;
+    --text: #1f2733;
+    --muted: #6b7686;
+    --primary: #2563eb;
+    --primary-hover: #1d4ed8;
+    --danger: #dc2626;
+    --danger-bg: #fef2f2;
+    --ok-bg: #f0fdf4;
+    --ok-border: #16a34a;
+    --keep-bg: #f0fdf4;
+    --drop-bg: #fef2f2;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 28px 20px 64px; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  .nav { margin: 0 0 16px; font-size: 14px; }
+  .nav a { color: var(--primary); text-decoration: none; margin-right: 16px; }
+  .nav a:hover { text-decoration: underline; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  label { display: block; font-weight: 600; margin-bottom: 6px; }
+  .hint { color: var(--muted); font-weight: 400; font-size: 13px; }
+  textarea {
+    width: 100%;
+    min-height: 220px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font: 13px/1.6 var(--mono);
+    resize: vertical;
+  }
+  textarea:focus, input:focus { outline: 2px solid rgba(37, 99, 235, .35); border-color: var(--primary); }
+  table.cuts { width: 100%; border-collapse: separate; border-spacing: 0 8px; }
+  table.cuts th {
+    text-align: left;
+    font-size: 13px;
+    color: var(--muted);
+    font-weight: 600;
+    padding: 0 8px 0 0;
+  }
+  table.cuts td { padding: 0; vertical-align: middle; }
+  table.cuts td.time { width: 44%; padding-right: 8px; }
+  table.cuts td.op { width: 40px; text-align: center; color: var(--muted); }
+  table.cuts td.del { width: 44px; text-align: right; }
+  input[type="text"] {
+    width: 100%;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font: 14px var(--mono);
+  }
+  button {
+    border: 1px solid var(--border);
+    background: #fff;
+    color: var(--text);
+    border-radius: 8px;
+    padding: 8px 16px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  button:hover { background: #f1f4f9; }
+  button.primary {
+    background: var(--primary);
+    border-color: var(--primary);
+    color: #fff;
+    font-weight: 600;
+    padding: 10px 22px;
+  }
+  button.primary:hover { background: var(--primary-hover); }
+  button.danger-link { border-color: transparent; color: var(--danger); padding: 4px 8px; }
+  button.danger-link:hover { background: var(--danger-bg); }
+  .toolbar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+  .alert {
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    font-size: 14px;
+    white-space: pre-wrap;
+  }
+  .alert.error { background: var(--danger-bg); border: 1px solid var(--danger); color: var(--danger); }
+  .alert.ok { background: var(--ok-bg); border: 1px solid var(--ok-border); color: #166534; }
+  .hidden { display: none; }
+  table.cues { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
+  table.cues th, table.cues td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; vertical-align: top; }
+  table.cues th { background: #f8fafc; }
+  table.cues td.num { width: 56px; color: var(--muted); text-align: right; }
+  table.cues td.tc { font-family: var(--mono); white-space: nowrap; }
+  tr.keep td { background: var(--keep-bg); }
+  tr.drop td { background: var(--drop-bg); color: var(--muted); }
+  .badge { display: inline-block; border-radius: 4px; padding: 0 8px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .badge.keep { background: #dcfce7; color: #166534; }
+  .badge.split { background: #dbeafe; color: #1e40af; }
+  .badge.drop { background: #fee2e2; color: #991b1b; }
+  .frag { font-family: var(--mono); white-space: nowrap; }
+  .muted { color: var(--muted); }
+  .preview {
+    width: 100%;
+    max-height: 320px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font: 12px/1.6 var(--mono);
+    background: #fafbfc;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="nav">
+    <a href="/">字幕时间漂移校正</a>
+    <a href="/placement">字幕位置规划</a>
+    <a href="/reading-load">阅读负荷热区</a>
+    <a href="/terms">字幕专名统一</a>
+    <a href="/wrap">字幕智能断行</a>
+    <a href="/chapters">字幕章节规划</a>
+    <a href="/topic-clip">主题短片段检索</a>
+    <a href="/bilingual-align">双语字幕配对</a>
+    <a href="/selection">重叠字幕择优保留</a>
+  </p>
+  <h1>删段后字幕接轴</h1>
+  <p class="sub">粘贴 SRT，填入若干要从视频中删除的时间区间（毫秒精度）。系统先校验区间并把重叠或首尾相接的
+    区间合并，再按半开区间 [start, end) 逐条裁切字幕：完全落入删除区间的丢弃，跨删除区间的拆成多个片段，
+    与删除区间恰好相接的完整保留；所有保留片段按累计删除时长整体前移（片段时长不变），最后从 1 连续编号
+    输出新 SRT 与原序号 → 新序号对应表。</p>
+
+  <div class="card">
+    <label for="srt">原始 SRT 字幕</label>
+    <textarea id="srt" placeholder="1&#10;00:00:01,000 --> 00:00:04,000&#10;第一句字幕&#10;&#10;2&#10;00:00:05,000 --> 00:00:09,500&#10;第二句字幕"></textarea>
+  </div>
+
+  <div class="card">
+    <h2>删除区间
+      <span class="hint">开始 → 结束，重叠或首尾相接的区间自动合并；时间格式 HH:MM:SS,mmm；整行留空视为不添加</span>
+    </h2>
+    <table class="cuts">
+      <thead>
+        <tr>
+          <th style="width:44%">删除开始时间</th>
+          <th style="width:44%">删除结束时间</th>
+          <th style="width:40px"></th>
+          <th style="width:44px"></th>
+        </tr>
+      </thead>
+      <tbody id="cutRows"></tbody>
+    </table>
+    <div class="toolbar">
+      <button type="button" id="addCut">+ 添加删除区间</button>
+      <button type="button" id="fillExample">填入示例</button>
+    </div>
+  </div>
+
+  <div id="errorBox" class="alert error hidden"></div>
+
+  <div class="toolbar" style="margin-bottom: 20px;">
+    <button type="button" class="primary" id="submit">接轴</button>
+    <span class="hint" id="status"></span>
+  </div>
+
+  <div id="resultCard" class="card hidden">
+    <h2>接轴结果</h2>
+    <div id="okBox" class="alert ok hidden"></div>
+    <div class="toolbar" style="margin-top:0;">
+      <button type="button" class="primary" id="download">下载 shifted.srt</button>
+      <span class="hint" id="mergedCuts"></span>
+    </div>
+
+    <h2 style="margin-top:18px;">逐条裁切结果</h2>
+    <table class="cues">
+      <thead>
+        <tr>
+          <th>输入序号</th>
+          <th>原序号</th>
+          <th>原时间轴</th>
+          <th>处理</th>
+          <th>新时间轴（片段）</th>
+          <th>正文</th>
+        </tr>
+      </thead>
+      <tbody id="cueRows"></tbody>
+    </table>
+
+    <h2 style="margin-top:18px;">原序号 → 新序号对应表</h2>
+    <table class="cues">
+      <thead>
+        <tr>
+          <th>输入序号</th>
+          <th>原序号</th>
+          <th>新序号</th>
+        </tr>
+      </thead>
+      <tbody id="mapRows"></tbody>
+    </table>
+
+    <h2 style="margin-top:18px;">接轴后 SRT 预览</h2>
+    <pre class="preview" id="srtPreview"></pre>
+  </div>
+</div>
+
+<script>
+(function () {
+  const srtEl = document.getElementById("srt");
+  const cutRowsEl = document.getElementById("cutRows");
+  const errorBox = document.getElementById("errorBox");
+  const resultCard = document.getElementById("resultCard");
+  const okBox = document.getElementById("okBox");
+  const cueRowsEl = document.getElementById("cueRows");
+  const mapRowsEl = document.getElementById("mapRows");
+  const srtPreviewEl = document.getElementById("srtPreview");
+  const mergedCutsEl = document.getElementById("mergedCuts");
+  const statusEl = document.getElementById("status");
+
+  function addRow(start, end) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      '<td class="time"><input type="text" class="start" placeholder="00:00:06,000" spellcheck="false"></td>' +
+      '<td class="time"><input type="text" class="end" placeholder="00:00:08,000" spellcheck="false"></td>' +
+      '<td class="op">→</td>' +
+      '<td class="del"><button type="button" class="danger-link" title="删除该区间">删除</button></td>';
+    tr.querySelector(".start").value = start || "";
+    tr.querySelector(".end").value = end || "";
+    tr.querySelector(".danger-link").addEventListener("click", () => tr.remove());
+    cutRowsEl.appendChild(tr);
+  }
+
+  function collectCuts() {
+    const cuts = [];
+    for (const tr of cutRowsEl.querySelectorAll("tr")) {
+      const start = tr.querySelector(".start").value.trim();
+      const end = tr.querySelector(".end").value.trim();
+      // 整行留空视为不添加；只填一侧交给服务端校验并返回 422
+      if (!start && !end) continue;
+      cuts.push({ start, end });
+    }
+    return cuts;
+  }
+
+  function showError(message) {
+    errorBox.textContent = message;
+    errorBox.classList.remove("hidden");
+  }
+  function clearAlerts() {
+    errorBox.classList.add("hidden");
+    okBox.classList.add("hidden");
+    errorBox.textContent = "";
+    okBox.textContent = "";
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+  }
+
+  document.getElementById("addCut").addEventListener("click", () => addRow());
+
+  const EXAMPLE_SRT =
+    "1\n00:00:01,000 --> 00:00:04,000\n开场白，完整保留\n\n" +
+    "2\n00:00:05,000 --> 00:00:09,500\n被删段从中裁断的字幕\n\n" +
+    "3\n00:00:10,000 --> 00:00:12,000\n整段落在删除区间内\n\n" +
+    "4\n00:00:13,000 --> 00:00:16,000\n起点恰好接在删除区间末尾\n\n" +
+    "5\n00:00:16,500 --> 00:00:19,000\n片尾内容，整体前移\n";
+
+  document.getElementById("fillExample").addEventListener("click", () => {
+    srtEl.value = EXAMPLE_SRT;
+    cutRowsEl.innerHTML = "";
+    addRow("00:00:06,000", "00:00:08,000");
+    addRow("00:00:08,000", "00:00:09,000");
+    addRow("00:00:09,500", "00:00:13,000");
+    clearAlerts();
+    resultCard.classList.add("hidden");
+  });
+
+  function render(data) {
+    cueRowsEl.innerHTML = data.cues.map(c => {
+      let badge;
+      if (!c.kept) badge = '<span class="badge drop">丢弃</span>';
+      else if (c.fragments.length > 1)
+        badge = '<span class="badge split">拆成 ' + c.fragments.length + " 段</span>";
+      else badge = '<span class="badge keep">保留</span>';
+      const frags = c.fragments.map(f =>
+        '<span class="frag">#' + f.new_index + "　" + escapeHtml(f.start) +
+        " → " + escapeHtml(f.end) + "</span>"
+      ).join("<br>");
+      return '<tr class="' + (c.kept ? "keep" : "drop") + '">' +
+        '<td class="num">' + c.cue_order + "</td>" +
+        '<td class="num">' + escapeHtml(c.index) + "</td>" +
+        '<td class="tc">' + escapeHtml(c.start) + "<br>" + escapeHtml(c.end) + "</td>" +
+        "<td>" + badge + "</td>" +
+        '<td class="tc">' + (frags || '<span class="muted">—</span>') + "</td>" +
+        "<td>" + escapeHtml(c.text).replace(/\n/g, "<br>") + "</td>" +
+        "</tr>";
+    }).join("");
+
+    mapRowsEl.innerHTML = data.mapping.map(m =>
+      "<tr>" +
+      '<td class="num">' + m.cue_order + "</td>" +
+      '<td class="num">' + escapeHtml(m.index) + "</td>" +
+      "<td>" + (m.new_indices.length
+        ? m.new_indices.join(", ")
+        : '<span class="muted">已丢弃</span>') + "</td>" +
+      "</tr>"
+    ).join("");
+
+    srtPreviewEl.textContent = data.shifted_srt || "（全部字幕均被删除，输出为空）";
+    mergedCutsEl.textContent = data.merged_cuts.length
+      ? "合并后删除区间：" + data.merged_cuts.map(c => c.start + " → " + c.end).join("；")
+      : "未填写删除区间，仅重新编号。";
+    okBox.textContent =
+      "共 " + data.cue_count + " 条字幕：保留 " + data.kept_count + " 条（其中拆分 "
+      + data.split_count + " 条）、丢弃 " + data.dropped_count + " 条，输出 "
+      + data.fragment_count + " 条连续编号的新字幕；删除区间合并为 "
+      + data.merged_cuts.length + " 段，共删除 " + data.total_cut_ms + " ms。";
+    okBox.classList.remove("hidden");
+  }
+
+  document.getElementById("submit").addEventListener("click", async () => {
+    clearAlerts();
+    resultCard.classList.add("hidden");
+    statusEl.textContent = "接轴中…";
+
+    try {
+      const resp = await fetch("/api/cut-shift", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ srt: srtEl.value, cuts: collectCuts() })
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        showError((data.detail && data.detail.message) || ("请求失败（HTTP " + resp.status + "）"));
+        statusEl.textContent = "";
+        return;
+      }
+
+      // 预览与下载共用接口返回的同一份 shifted_srt
+      window.__shiftedSrt = data.shifted_srt;
+      render(data);
+      resultCard.classList.remove("hidden");
+      statusEl.textContent = "";
+    } catch (err) {
+      showError("请求出错：" + err);
+      statusEl.textContent = "";
+    }
+  });
+
+  document.getElementById("download").addEventListener("click", () => {
+    const content = window.__shiftedSrt || "";
+    const blob = new Blob([content], { type: "application/x-subrip;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "shifted.srt";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+
+  // 初始一行空区间
+  addRow();
+})();
+</script>
+</body>
+</html>

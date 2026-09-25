@@ -1,4 +1,4 @@
-"""字幕时间漂移校正、位置规划、阅读负荷分析与章节规划等字幕工具 Web 服务（FastAPI）。"""
+"""字幕时间漂移校正、位置规划、阅读负荷分析、章节规划与删段接轴等字幕工具 Web 服务（FastAPI）。"""
 from __future__ import annotations
 
 import math
@@ -20,6 +20,7 @@ from .bilingual import (
     align_bilingual,
 )
 from .chapters import ChapterError, plan_chapters
+from .cutshift import CutShiftError, parse_cuts, shift_cues
 from .mapping import AnchorError, PiecewiseMapping, build_anchors
 from .placement import (
     Block,
@@ -44,14 +45,15 @@ from .topic_clip import (
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI(
-    title="字幕校正、位置规划、专名统一、阅读负荷、智能断行、章节规划、择优保留、主题片段检索与双语配对工具",
+    title="字幕校正、位置规划、专名统一、阅读负荷、智能断行、章节规划、择优保留、主题片段检索、双语配对与删段接轴工具",
     description="粘贴 SRT 后可做时间漂移校正、按画面遮挡时段规划字幕上下位置、"
     "统一专名别名、分析重叠字幕叠加后的阅读负荷热区、按列数 / 行数限制智能断行、"
     "按章节数与优选停顿把整段字幕切成时长均衡的连续章节、"
     "按优先级与最小间隔从重叠字幕中择优保留必须保留条目、"
-    "按多组关键词检索覆盖所需字幕条数的最短连续字幕片段，"
-    "或把左右两份字幕按时间跨度做 1:1 / 1:2 / 2:1 单调配对。",
-    version="1.8.0",
+    "按多组关键词检索覆盖所需字幕条数的最短连续字幕片段、"
+    "把左右两份字幕按时间跨度做 1:1 / 1:2 / 2:1 单调配对，"
+    "或按要从视频中删除的时间区间裁切字幕并整体前移重新编号。",
+    version="1.9.0",
 )
 
 _FIELD_LABELS = {
@@ -71,6 +73,7 @@ _FIELD_LABELS = {
     "required_count": "关键词所需字幕条数",
     "left_srt": "左侧 SRT 内容",
     "right_srt": "右侧 SRT 内容",
+    "cuts": "删除区间",
 }
 
 
@@ -486,6 +489,55 @@ class SelectionResponse(BaseModel):
     conflicts: list[SelectionConflictView]
 
 
+class CutIn(BaseModel):
+    start: str = Field(..., description="删除开始时间，HH:MM:SS,mmm")
+    end: str = Field(..., description="删除结束时间，HH:MM:SS,mmm，须严格晚于开始")
+
+
+class CutShiftRequest(BaseModel):
+    srt: str = Field(..., description="原始 SRT 内容")
+    cuts: list[CutIn] = Field(
+        default_factory=list, description="要从视频中删除的时间区间（毫秒精度）"
+    )
+
+
+class CutShiftFragmentView(BaseModel):
+    new_index: int
+    start: str
+    end: str
+    original_start: str
+    original_end: str
+
+
+class CutShiftCueView(BaseModel):
+    cue_order: int
+    index: str
+    start: str
+    end: str
+    text: str
+    kept: bool
+    fragments: list[CutShiftFragmentView]
+
+
+class CutShiftMappingView(BaseModel):
+    cue_order: int
+    index: str
+    new_indices: list[int]
+
+
+class CutShiftResponse(BaseModel):
+    shifted_srt: str
+    cue_count: int
+    kept_count: int
+    dropped_count: int
+    split_count: int
+    fragment_count: int
+    total_cut_ms: int
+    merged_cuts: list[BlockView]
+    cues: list[CutShiftCueView]
+    mapping: list[CutShiftMappingView]
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -534,6 +586,11 @@ def bilingual_align_page() -> FileResponse:
 @app.get("/selection")
 def selection_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "selection.html")
+
+
+@app.get("/cut-shift")
+def cut_shift_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "cut_shift.html")
 
 
 @app.post("/api/correct", response_model=CorrectResponse)
@@ -1086,4 +1143,87 @@ def selection(req: SelectionRequest) -> SelectionResponse | JSONResponse:
         selected_srt=format_srt(kept_cues),
         cues=cue_views,
         conflicts=[],
+    )
+
+
+@app.post("/api/cut-shift", response_model=CutShiftResponse)
+def cut_shift(req: CutShiftRequest) -> CutShiftResponse | JSONResponse:
+    # 1. 复用现有 SRT 解析器
+    try:
+        cues = parse_srt(req.srt)
+    except SrtParseError as exc:
+        raise HTTPException(status_code=422, detail={"type": "srt", "message": str(exc)})
+
+    # 2. 校验删除区间（结束须严格晚于开始），并把重叠 / 首尾相接的区间合并
+    try:
+        cuts = parse_cuts([(c.start, c.end) for c in req.cuts])
+    except CutShiftError as exc:
+        raise HTTPException(
+            status_code=422, detail={"type": "cuts", "message": str(exc)}
+        )
+
+    # 3. 逐条裁切：完全落入删除区间的字幕丢弃，跨删除区间的拆成多个片段，
+    #    保留片段按 [0, 片段开始) 内累计删除时长整体前移（片段时长不变）
+    shifts = shift_cues(cues, cuts)
+
+    # 4. 保留片段按原顺序从 1 连续编号，输出新 SRT 与原序号 → 新序号对应表
+    new_cues: list[Cue] = []
+    fragment_views: list[list[CutShiftFragmentView]] = []
+    for cue, shift in zip(cues, shifts):
+        views: list[CutShiftFragmentView] = []
+        for frag in shift.fragments:
+            new_index = len(new_cues) + 1
+            new_cues.append(
+                Cue(
+                    index=str(new_index),
+                    start=frag.new_start,
+                    end=frag.new_end,
+                    text=cue.text,
+                )
+            )
+            views.append(
+                CutShiftFragmentView(
+                    new_index=new_index,
+                    start=format_timecode(frag.new_start),
+                    end=format_timecode(frag.new_end),
+                    original_start=format_timecode(frag.original_start),
+                    original_end=format_timecode(frag.original_end),
+                )
+            )
+        fragment_views.append(views)
+
+    cue_views = [
+        CutShiftCueView(
+            cue_order=pos + 1,
+            index=cue.index,
+            start=format_timecode(cue.start),
+            end=format_timecode(cue.end),
+            text=cue.text,
+            kept=shift.kept,
+            fragments=fragment_views[pos],
+        )
+        for pos, (cue, shift) in enumerate(zip(cues, shifts))
+    ]
+
+    return CutShiftResponse(
+        shifted_srt=format_srt(new_cues) if new_cues else "",
+        cue_count=len(cues),
+        kept_count=sum(1 for shift in shifts if shift.kept),
+        dropped_count=sum(1 for shift in shifts if not shift.kept),
+        split_count=sum(1 for shift in shifts if len(shift.fragments) > 1),
+        fragment_count=len(new_cues),
+        total_cut_ms=sum(cut.end - cut.start for cut in cuts),
+        merged_cuts=[
+            BlockView(start=format_timecode(cut.start), end=format_timecode(cut.end))
+            for cut in cuts
+        ],
+        cues=cue_views,
+        mapping=[
+            CutShiftMappingView(
+                cue_order=pos + 1,
+                index=cue.index,
+                new_indices=[view.new_index for view in fragment_views[pos]],
+            )
+            for pos, cue in enumerate(cues)
+        ],
     )
